@@ -184,11 +184,25 @@ IS
     p_file_loc VARCHAR2,
     p_file_name VARCHAR2
     );
+  PROCEDURE p_get_nl_goradid_err(
+    p_file_loc VARCHAR2,
+    p_file_name VARCHAR2
+  );
+  PROCEDURE p_email_nl_guids_err;
   PROCEDURE p_email_multi_guids_err(
     p_adid_code     VARCHAR2);
   PROCEDURE p_email_multi_pidms_err(
     p_adid_code     VARCHAR2);
   PROCEDURE p_run_email_procedures;
+  PROCEDURE p_send_mail_attachment 
+  (p_to          IN VARCHAR2,
+   p_from        IN VARCHAR2,
+   p_cc          IN VARCHAR2 DEFAULT NULL,
+   p_subject     IN VARCHAR2,
+   p_text_msg    IN VARCHAR2 DEFAULT NULL,
+   p_attach_name IN VARCHAR2 DEFAULT NULL,
+   p_attach_mime IN VARCHAR2 DEFAULT NULL,
+   p_attach_clob IN CLOB DEFAULT NULL);
 END import_slate_data_2_pkg;
     
 /
@@ -4528,8 +4542,183 @@ PROCEDURE p_srrprel_in_gjbprun(
       END;
     END LOOP;
     utl_file.fclose(output_file);
-
+    
   END p_get_srrprel_err;
+  ------------
+    
+  PROCEDURE p_get_nl_goradid_err(
+    p_file_loc VARCHAR2,
+    p_file_name VARCHAR2
+  )
+  IS  
+    v_slate_refid       srvprel.srvprel_additional_id%TYPE;
+    v_pidm              srvprel.srvprel_pidm%TYPE;
+    v_id                srvprel.srvprel_id%TYPE;
+    v_name              VARCHAR2(200);
+    v_term_code         srvprel.srvprel_term_code%TYPE;
+    v_match_status      srvprel.srvprel_match_status%TYPE;
+    v_banner_refid      goradid.goradid_additional_id%TYPE;
+    v_banner_refid_date goradid.goradid_activity_date%TYPE;
+    v_error_text        VARCHAR2(200);
+    output_file         UTL_FILE.file_type;
+    v_output_line       VARCHAR2(2000);
+    v_goradid_cnt       NUMBER;
+    
+  BEGIN
+    
+    output_file := utl_file.fopen(p_file_loc, p_file_name, 'R');
+    LOOP
+      BEGIN
+        utl_file.get_line(output_file, v_output_line);
+        v_output_line := TRIM(BOTH ' ' FROM v_output_line);
+        IF v_output_line LIKE '%-NL' --contains "NL" tag at the end
+        THEN       
+          v_id := SUBSTR(v_output_line,1,9) ; 
+          BEGIN
+            SELECT DISTINCT srvprel_additional_id, srvprel_pidm, srvprel_last_name || ', ' ||srvprel_first_name,
+            srvprel_term_code, srvprel_match_status
+            INTO v_slate_refid, v_pidm, v_name, v_term_code, v_match_status
+            FROM srvprel 
+            WHERE srvprel_id = v_id
+            AND srvprel_adid_code = 'SL';
+          EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+              v_pidm := NULL;
+              v_name := RTRIM(SUBSTR(v_output_line, 12, 33));
+              v_match_status := RTRIM(SUBSTR(v_output_line, 45, 5));
+              v_term_code := RTRIM(SUBSTR(v_output_line, 50, 6));
+              v_slate_refid := RTRIM(SUBSTR(v_output_line, 117, INSTR(v_output_line, '-NL', 1)-117));
+            WHEN OTHERS THEN
+              p_handle_err('UNKNOWN', 'Error while retrieving data for prospect ID: ' || v_id || '. ' || SUBSTR (TO_CHAR (SQLCODE) || ' ' || SQLERRM, 1, 300), 'p_get_nl_goradid_err');
+          END;
+          
+          IF v_pidm IS NULL
+          THEN
+            SELECT spriden_pidm
+            INTO v_pidm
+            FROM spriden 
+            WHERE spriden_id = v_id
+            AND spriden_change_ind IS NULL;
+          END IF;
+          
+          SELECT COUNT(*)
+            INTO v_goradid_cnt
+            FROM goradid
+            WHERE goradid_pidm = v_pidm
+            AND goradid_adid_code = 'SL';
+            
+          IF v_goradid_cnt = 1
+          THEN
+            SELECT goradid_additional_id, goradid_activity_date
+            INTO v_banner_refid, v_banner_refid_date
+            FROM goradid
+            WHERE goradid_pidm = v_pidm
+            AND goradid_adid_code = 'SL';
+            
+            INSERT INTO adm_slate_nl_guids
+            VALUES ( v_slate_refid, v_banner_refid, v_banner_refid_date,
+                   v_pidm, v_id, v_name, v_term_code, v_match_status, 
+                   SYSDATE, gb_common.f_sct_user, p_file_name );
+            COMMIT;
+          END IF; 
+
+        END IF;
+      EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+          EXIT;
+      END;
+    END LOOP;
+    utl_file.fclose(output_file);
+  END p_get_nl_goradid_err;
+  ------------
+  PROCEDURE p_email_nl_guids_err
+  IS
+    l_message        CLOB;
+    v_mailto         VARCHAR2(100);
+    v_mailfrom       VARCHAR2(100);
+    v_mailcc         VARCHAR2(100);
+    v_mailsubject    VARCHAR2(200) := '';
+    v_db             VARCHAR2(30);
+    v_count          NUMBER := 0;
+    v_file_name      VARCHAR2(80);
+    CURSOR nl_guids_c
+    IS
+      SELECT slate_refid, banner_refid, banner_refid_date, 
+             banner_pidm, banner_id, full_name, term_code, match_status
+      FROM adm_slate_nl_guids
+      WHERE TRUNC(activity_date) = TRUNC(SYSDATE);
+      
+    err_rec     nl_guids_c%ROWTYPE;
+  BEGIN
+    SELECT ora_database_name 
+    INTO v_db
+    FROM dual;
+    
+    IF v_db = 'PROD.WORLD'
+    THEN
+      v_db := 'PROD';
+    ELSIF v_db = 'DEVX.WORLD' 
+    THEN
+      v_db := 'DEVX';
+    ELSIF v_db = 'PPOD.WORLD'
+    THEN
+      v_db := 'PPOD';
+    END IF;
+    
+    IF nl_guids_c%ISOPEN
+    THEN
+      CLOSE nl_guids_c;
+    END IF;
+    
+    OPEN nl_guids_c;
+    LOOP
+      FETCH nl_guids_c INTO err_rec;
+      EXIT WHEN nl_guids_c%NOTFOUND;
+      l_message := l_message || ( 
+                  'Slate Ref ID (not loaded): '||err_rec.slate_refid ||chr(10)||chr(13)||
+                  'Slate Ref ID #2 (loaded): '||err_rec.banner_refid||chr(10)||chr(13)|| 
+                  'Slate Ref ID #2 loaded date: '||err_rec.banner_refid_date||chr(10)||chr(13)|| 
+                  'Banner ID: '||err_rec.banner_id||chr(10)||chr(13)||
+                  'Banner PIDM: '||err_rec.banner_pidm||chr(10)||chr(13)|| 
+                  'Full Name: '||err_rec.full_name ||chr(10)||chr(13)||
+                  'Term Code: '||err_rec.term_code ||chr(10)||chr(13)||
+                  'Level Code: '||'UG' ||chr(10)||chr(13)||
+                  'Match Status (M= Matched, S= Suspend, D= Duplicate): '||err_rec.match_status ||chr(10)||chr(13))||
+                  
+                  '================================================='||chr(10)||chr(13);
+      v_count := v_count + 1;
+      
+    END LOOP;
+    CLOSE nl_guids_c;
+    IF v_count > 0 
+    THEN   
+      v_mailsubject   := '**'|| v_db || '** Please Resolve Records with Non-Loaded Slate ID ' ||to_char(sysdate, 'MM/DD/YYYY') ;
+      v_mailfrom := 'tnguyen@smith.edu';
+      v_mailto := 'jdrawe@smith.edu';
+      v_mailcc := 'tnguyen@smith.edu,kkatamay@smith.edu,kmessier@smith.edu';--'kdenno@smith.edu';
+      v_file_name := 'NonLoadedSlateIDs_' || v_db || to_char(sysdate, 'YYYYMonDD')  || '.txt';
+      p_send_mail_attachment(
+            p_to          => v_mailto,
+            p_from        => v_mailfrom,
+            p_cc          => v_mailcc,
+            p_subject     => v_mailsubject,
+            p_text_msg    => 'Please see attached report of prospects whose '||
+                             'Slate Ref IDs could not be loaded into Banner. '||
+                             'This error exists because the Banner ID/PIDM is ' ||
+                             'currently mapped to a different Slate Ref ID in Banner. '||chr(10)||chr(13)||
+                             'To resolve for each record, please check first if '||
+                             'the loaded Slate Ref ID (#2) exists in Slate, '||
+                             'then navigate to "Additional Identification" tab '|| 
+                             'on Banner screen SPAIDEN and reassign the correct '||
+                             'Slate Ref ID to match with the record in Slate. '||chr(10)||chr(13)||
+                             'For any troubleshooting assistance or questions, '||
+                             'please contact Administrative Technology.',
+            p_attach_name => v_file_name,
+            p_attach_mime => 'text/plain',
+            p_attach_clob => l_message);
+      
+    END IF;
+  END p_email_nl_guids_err;
   ------------
   PROCEDURE p_email_multi_guids_err(
     p_adid_code     VARCHAR2)
@@ -4744,6 +4933,86 @@ PROCEDURE p_srrprel_in_gjbprun(
   BEGIN
     p_email_multi_guids_err('SL');
     p_email_multi_pidms_err('SL');
+    p_email_nl_guids_err;
     p_email_error;
   END p_run_email_procedures;
+  ----------
+  PROCEDURE p_send_mail_attachment 
+  (p_to          IN VARCHAR2,
+   p_from        IN VARCHAR2,
+   p_cc          IN VARCHAR2 DEFAULT NULL,
+   p_subject     IN VARCHAR2,
+   p_text_msg    IN VARCHAR2 DEFAULT NULL,
+   p_attach_name IN VARCHAR2 DEFAULT NULL,
+   p_attach_mime IN VARCHAR2 DEFAULT NULL,
+   p_attach_clob IN CLOB DEFAULT NULL)
+  AS
+    p_smtp_host   VARCHAR2 (50) := 'smtp.smith.edu';  
+    p_smtp_port   NUMBER        := 25;
+    l_mail_conn   UTL_SMTP.connection;
+    l_boundary    VARCHAR2(50) := '--_NextPart_BoundMul_RAC987345';
+    l_step        PLS_INTEGER  := 12000; -- make sure you set a multiple of 3 not higher than 24573
+  
+    v_to_list DBMS_UTILITY.UNCL_ARRAY;
+    v_cc_list DBMS_UTILITY.UNCL_ARRAY;
+    v_length  NUMBER;
+  BEGIN
+   --DBMS_UTILITY.COMMA_TO_TABLE (p_to, v_length, v_to_list);
+
+   --
+   
+    l_mail_conn := UTL_SMTP.open_connection(p_smtp_host, p_smtp_port);
+    UTL_SMTP.helo(l_mail_conn, p_smtp_host);
+    UTL_SMTP.mail(l_mail_conn, p_from);
+    UTL_SMTP.rcpt(l_mail_conn, p_to);
+    IF p_cc IS NOT NULL
+    THEN
+      dbms_output.enable(1000000);
+      DBMS_UTILITY.COMMA_TO_TABLE (p_cc, v_length, v_cc_list);
+      FOR i IN 1 .. v_length
+      LOOP
+        DBMS_OUTPUT.PUT_LINE(v_cc_list(i));
+        UTL_SMTP.rcpt(l_mail_conn, TRIM(v_cc_list(i)));
+      END LOOP;
+      
+    END IF;
+    UTL_SMTP.open_data(l_mail_conn);
+    
+    UTL_SMTP.write_data(l_mail_conn, 'Date: ' || TO_CHAR(SYSDATE, 'DD-MON-YYYY HH24:MI:SS') || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'To: ' || p_to || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'From: ' || p_from || UTL_TCP.crlf);
+    IF TRIM(p_cc) IS NOT NULL
+    THEN
+      UTL_SMTP.write_data(l_mail_conn, 'CC: ' || REPLACE(p_cc, ',', ';') || UTL_TCP.crlf);     
+    END IF;
+    UTL_SMTP.write_data(l_mail_conn, 'Subject: ' || p_subject || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'Reply-To: ' || p_from || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'MIME-Version: 1.0' || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'Content-Type: multipart/mixed; boundary="' || l_boundary || '"' || UTL_TCP.crlf || UTL_TCP.crlf);
+    
+    IF p_text_msg IS NOT NULL THEN
+      UTL_SMTP.write_data(l_mail_conn, '--' || l_boundary || UTL_TCP.crlf);
+      UTL_SMTP.write_data(l_mail_conn, 'Content-Type: text/plain; charset="iso-8859-1"' || UTL_TCP.crlf || UTL_TCP.crlf);
+  
+      UTL_SMTP.write_data(l_mail_conn, p_text_msg);
+      UTL_SMTP.write_data(l_mail_conn, UTL_TCP.crlf || UTL_TCP.crlf);
+    END IF;
+  
+    IF p_attach_name IS NOT NULL THEN
+      UTL_SMTP.write_data(l_mail_conn, '--' || l_boundary || UTL_TCP.crlf);
+      UTL_SMTP.write_data(l_mail_conn, 'Content-Type: ' || p_attach_mime || '; name="' || p_attach_name || '"' || UTL_TCP.crlf);
+      UTL_SMTP.write_data(l_mail_conn, 'Content-Disposition: attachment; filename="' || p_attach_name || '"' || UTL_TCP.crlf || UTL_TCP.crlf);
+   
+      FOR i IN 0 .. TRUNC((DBMS_LOB.getlength(p_attach_clob) - 1 )/l_step) LOOP
+        UTL_SMTP.write_data(l_mail_conn, DBMS_LOB.substr(p_attach_clob, l_step, i * l_step + 1));
+      END LOOP;
+  
+      UTL_SMTP.write_data(l_mail_conn, UTL_TCP.crlf || UTL_TCP.crlf);
+    END IF;
+    
+    UTL_SMTP.write_data(l_mail_conn, '--' || l_boundary || '--' || UTL_TCP.crlf);
+    UTL_SMTP.close_data(l_mail_conn);
+  
+    UTL_SMTP.quit(l_mail_conn);
+  END p_send_mail_attachment;
 END import_slate_data_2_pkg;
