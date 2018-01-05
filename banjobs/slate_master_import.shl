@@ -1,0 +1,67 @@
+#!/bin/ksh
+
+. $HOME/.profile
+ORACLE_SID=DEVX; export ORACLE_SID
+. /opt/bin/oracle/oraenv
+
+cd /u03/app/banjobs/cronfiles
+###
+# slate_master_import.shl
+# Execute processes to import Slate person and application data from staging tables to Banner
+# Author: Tam Nguyen and Kaja Katamay
+# Script Name: slate_master_import.shl
+# Location: /u03/app/banjobs/cronfiles
+#
+### SRTPURG for Loaded records
+echo "Starting to execute script p_srtpurg_in_gjbprun.sql to get one-up-number and insert parameters for SRTPURG..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/p_srtpurg_in_gjbprun.sql SDLP M C U srtpurg_seqno.dat
+value=$(<srtpurg_seqno.dat)
+filename="srtpurg_`date +%Y%b%d`_$value.lis"
+# Run srtpurg for prel code SDLP status = M and load = C
+echo "Starting to execute SRTPURG to delete previously matched loaded records from SRT% tables..."
+srtpurg -f -o "$filename" `cat /u03/app/banjobs/inc/atownc` < /u03/app/banjobs/cronfiles/srtpurg_seqno.dat
+
+### Import Person Data
+echo "Starting to execute atowner.import_slate_data_2_pkg.p_import_pers_to_temp to import person data to SRT% tables..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/run_slate_pers_import.sql
+
+### SRRSRIN to Assign Match Status
+echo "Starting to execute script p_srrsrin_in_gjbprun.sql to get one-up-number and insert parameters for SRRSRIN..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/p_srrsrin_in_gjbprun.sql SDLP srrsrin_seqno.dat
+value=$(<srrsrin_seqno.dat)
+filename="srrsrin_`date +%Y%b%d`_$value.lis"
+# Run srrsrin for prel code SDLP
+echo "Starting to execute SRRSRIN to assign match status..."
+srrsrin -f -o "$filename" `cat /u03/app/banjobs/inc/atownc` < /u03/app/banjobs/cronfiles/srrsrin_seqno.dat
+
+### SRRPREL to Migrate Prospect Data
+echo "Starting to execute script p_srrprel_in_gjbprun.sql to get one-up-number and insert parameters for SRRPREL..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/p_srrprel_in_gjbprun.sql SDLP A srrprel_seqno.dat
+value=$(<srrprel_seqno.dat)
+srrprel_file="srrprel_`date +%Y%b%d`_$value.lis"
+# Run srrprel for prel code SDLP status = A (for M & N) and not yet loaded
+srrprel -f -o "$srrprel_file" `cat /u03/app/banjobs/inc/atownc` < /u03/app/banjobs/cronfiles/srrprel_seqno.dat
+
+### Get SRRPREL errors into SDLPERR error table for reporting to users
+echo "Starting to execute script get get_slate_srrprel_err.sql to retrieve API-violation errors from recent SRRPREL runs..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/get_slate_srrprel_err.sql BANJOBS_DIR $srrprel_file
+
+echo "Starting to execute script get_slate_nl_guid_err.sql to retrieve errors in which goradid_additional_ids are not loaded because of Banner mapping discrepancy..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/get_slate_nl_guid_err.sql BANJOBS_DIR $srrprel_file
+### Import Application Data
+echo "Starting to execute atowner.import_slate_data_2_pkg.p_import_applications_schools to migrate application data..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/run_slate_appl_import.sql
+
+### Import Contacts Data
+echo "Starting to execute atowner.import_slate_data_2_pkg.p_import_pers_contacts to migrate admissions contacts data..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/run_slate_appl_contacts.sql
+
+### Import Interests data
+echo "Starting to execute atowner.import_slate_data_2_pkg.p_import_appl_interests to migrate admission interest codes used by SFS..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/run_slate_appl_sfs_codes.sql
+
+### Run procedure to email out errors
+echo "Starting to execute atowner.import_slate_data_2_pkg.p_run_email_procedures to email out errors to users..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/run_slate_email_import_err.sql
+
+exit;
