@@ -1,0 +1,27 @@
+#!/bin/ksh
+. $HOME/.profile
+ORACLE_SID=DEVX; export ORACLE_SID
+. /opt/bin/oracle/oraenv
+cd /u03/app/banjobs/cronfiles
+
+# srrprel_slate_match.shl
+# Execute the SRRPREL process on Banner to migrate records that had been manually matched by Admission
+# Author: Tam Nguyen
+# Script Name: srrprel_slate_match.shl
+# Location: /u03/app/banjobs/cronfiles
+
+### SRRPREL for Manually Resolved Records
+echo "Starting to execute script p_srrprel_in_gjbprun.sql to get one-up-number for SRRPREL..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/p_srrprel_in_gjbprun.sql SDLP M srrprel_seqno.dat
+value=$(<srrprel_seqno.dat)
+srrprel_file="srrprel_matched_`date +%Y%b%d`_$value.lis"
+# Run srrprel
+echo "Starting to execute SRRPREL to load prospect data of manually resolved records..."
+srrprel -f -o "$srrprel_file" `cat /u03/app/banjobs/inc/atownc` < /u03/app/banjobs/cronfiles/srrprel_seqno.dat
+
+### Get SRRPREL errors into SDLPERR error table for reporting to users
+echo "Starting to execute script get get_slate_srrprel_err.sql to retrieve API-violation errors from recent SRRPREL runs..."
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/get_slate_srrprel_err.sql BANJOBS_DIR $srrprel_file
+
+echo "Starting to execute script get_slate_nl_guid_err.sql to retrieve errors in which goradid_additional_ids are not loaded because of Banner mapping discrepancy..." 
+echo `cat /u03/app/banjobs/inc/atowner` | sqlplus -s atowner @$BANNER_HOME/smith/student/plus/get_slate_nl_guid_err.sql BANJOBS_DIR $srrprel_file
