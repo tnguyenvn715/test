@@ -13,7 +13,16 @@ IS
   FUNCTION f_get_valid_natn(f_nation IN VARCHAR2) RETURN stvnatn.stvnatn_code%TYPE;
   FUNCTION f_check_date_format(f_date_str IN VARCHAR2, f_date_format IN VARCHAR2) RETURN VARCHAR2;
   FUNCTION f_check_valid_majr(f_majr_code IN VARCHAR2) RETURN VARCHAR2;
-  PROCEDURE p_import_pers_to_temp; 
+  PROCEDURE p_import_pers_to_temp;
+  PROCEDURE p_update_spriden_name(
+    p_guid            goradid.goradid_additional_id%TYPE,
+    p_pidm_in         spriden.spriden_pidm%TYPE,
+    p_id_in           spriden.spriden_id%TYPE,
+    p_new_last_name   spriden.spriden_last_name%TYPE,
+    p_new_first_name  spriden.spriden_first_name%TYPE,
+    p_new_mi_name     spriden.spriden_mi%TYPE,
+    p_origin_in       spriden.spriden_data_origin%TYPE,
+    p_user_in         spriden.spriden_user%TYPE DEFAULT gb_common.f_sct_user);
   PROCEDURE p_import_applicants;
   PROCEDURE p_insert_appl_cur_fos(
     p_guid          goradid.goradid_additional_id%TYPE DEFAULT NULL,
@@ -189,6 +198,15 @@ IS
   PROCEDURE p_email_multi_pidms_err(
     p_adid_code     VARCHAR2);
   PROCEDURE p_run_email_procedures;
+  PROCEDURE p_send_mail_attachment 
+    (p_to          IN VARCHAR2,
+     p_from        IN VARCHAR2,
+     p_subject     IN VARCHAR2,
+     p_text_msg    IN VARCHAR2 DEFAULT NULL,
+     p_attach_name IN VARCHAR2 DEFAULT NULL,
+     p_attach_mime IN VARCHAR2 DEFAULT NULL,
+     p_attach_clob IN CLOB DEFAULT NULL);
+  PROCEDURE p_report_adm_slate_name;
 END import_slate_data_2_pkg;
     
 /
@@ -666,14 +684,21 @@ IS
         
         IF v_szsiden_rec.pidm IS NOT NULL --pidm exist in general
         THEN
-          /*IF v_goradid_pidm_exist = 1
-          THEN
-            v_goradid_pidm := f_get_pidm_from_guid(v_szsiden_rec.guid, 'SL');
-          END IF;
-          IF v_goradid_pidm <>  v_szsiden_rec.pidm
+          v_goradid_pidm := f_get_pidm_from_guid(v_szsiden_rec.guid, 'SL');
+          IF v_goradid_pidm IS NOT NULL AND (v_goradid_pidm <>  v_szsiden_rec.pidm)
           THEN
             RAISE diff_pidm_in_goradid;
-          END IF;*/
+          END IF;
+          p_update_spriden_name
+            (v_szsiden_rec.guid,
+             v_szsiden_rec.pidm,
+             v_szsiden_rec.id,
+             v_szsiden_rec.last_name,
+             v_szsiden_rec.first_name,
+             v_szsiden_rec.middle_name,
+             'SLATE',
+             gb_common.f_sct_user);
+
           v_srtiden_match_status := 'M';
           v_srtiden_id := v_szsiden_rec.id;
           v_srtiden_pidm := v_szsiden_rec.pidm;    
@@ -966,11 +991,11 @@ IS
           v_error_mesg :=  'Banner ID ' || v_szsiden_rec.id || ' has more than one Slate Ref IDs. Cannot load to Ellucian temporary tables for prospect/person.';
           p_handle_err(v_szsiden_rec.guid, v_error_mesg, v_proc_name);
           
-        /*WHEN diff_pidm_in_goradid
+        WHEN diff_pidm_in_goradid
         THEN
           ROLLBACK TO startpoint;
-          v_error_mesg :=  'Slate Ref ID is mapped to another ID in Banner. Cannot load to Ellucian temporary tables for prospect/person.';
-          p_handle_err(v_szsiden_rec.guid, v_error_mesg, v_proc_name);*/
+          v_error_mesg :=  'Banner PIDM from Slate doesn''t match PIDM matched to this Slate Ref ID in GORADID table. Cannot load to Ellucian temporary tables for prospect/person.';
+          p_handle_err(v_szsiden_rec.guid, v_error_mesg, v_proc_name);
         
         WHEN OTHERS THEN
           ROLLBACK TO startpoint;
@@ -980,6 +1005,120 @@ IS
     END LOOP; 
     CLOSE szsiden_c;
   END p_import_pers_to_temp ;
+  ---------
+  PROCEDURE p_update_spriden_name(
+    p_guid            goradid.goradid_additional_id%TYPE,
+    p_pidm_in         spriden.spriden_pidm%TYPE,
+    p_id_in           spriden.spriden_id%TYPE,
+    p_new_last_name   spriden.spriden_last_name%TYPE,
+    p_new_first_name  spriden.spriden_first_name%TYPE,
+    p_new_mi_name     spriden.spriden_mi%TYPE,
+    p_origin_in       spriden.spriden_data_origin%TYPE,
+    p_user_in         spriden.spriden_user%TYPE DEFAULT gb_common.f_sct_user)
+  IS
+    v_error_mesg      VARCHAR2(200);
+    v_proc_name       VARCHAR2(60) := 'p_update_spriden_name';
+    v_old_last_name   spriden.spriden_last_name%TYPE;
+    v_old_first_name  spriden.spriden_first_name%TYPE;
+    v_old_mi_name     spriden.spriden_mi%TYPE;
+    CURSOR cur_acti_spriden
+    IS
+      SELECT spriden_last_name, spriden_first_name, spriden_mi 
+      FROM spriden 
+      WHERE spriden_pidm = p_pidm_in
+      AND spriden_change_ind IS NULL;
+    v_last_name_in    spriden.spriden_last_name%TYPE;
+    v_first_name_in   spriden.spriden_first_name%TYPE;
+    v_mi_in           spriden.spriden_mi%TYPE;
+    v_need_update     VARCHAR2(1 CHAR) := 'N';
+  BEGIN
+    IF cur_acti_spriden%ISOPEN
+    THEN
+      CLOSE cur_acti_spriden;
+    END IF;
+    
+    OPEN cur_acti_spriden;
+    LOOP
+      FETCH cur_acti_spriden INTO v_old_last_name, v_old_first_name, v_old_mi_name;
+      EXIT WHEN cur_acti_spriden%NOTFOUND;
+      
+      IF NVL(p_new_last_name, ' ') <> NVL(v_old_last_name, ' ')
+      THEN 
+        v_last_name_in := p_new_last_name;
+        v_need_update := 'Y';
+      ELSE 
+        v_last_name_in := v_old_last_name;
+      END IF;  
+      
+      IF NVL(p_new_first_name, ' ') <> NVL(v_old_first_name, ' ')
+      THEN
+        v_first_name_in := p_new_first_name;
+        v_need_update := 'Y';
+      ELSE
+        v_first_name_in := v_old_first_name;
+      END IF;
+      IF NVL(p_new_mi_name, ' ') <> NVL(v_old_mi_name, ' ')
+      THEN
+        v_mi_in := p_new_mi_name;
+        v_need_update := 'Y';
+      ELSE
+        v_mi_in := v_old_mi_name;
+      END IF;
+    END LOOP;
+    CLOSE cur_acti_spriden;
+  
+    
+    --Update name in SPRIDEN through GB_IDENTIFICATION API
+    IF v_need_update = 'Y'
+    THEN 
+      v_error_mesg := NULL;
+      BEGIN
+        baninst1.gb_identification.p_update(
+          p_pidm => p_pidm_in,
+          p_id => p_id_in,
+          p_last_name => v_last_name_in,
+          p_first_name => v_first_name_in,
+          p_mi => v_mi_in,
+          p_change_ind => NULL,
+          p_ntyp_code => NULL,
+          p_origin => p_origin_in,
+          p_data_origin => p_origin_in,
+          p_user => p_user_in);
+        COMMIT;
+      EXCEPTION
+        WHEN OTHERS THEN
+          v_error_mesg := 'Unable to use API to update name for Banner pidm ' || p_pidm_in || '.';
+          p_handle_err(p_guid, v_error_mesg, v_proc_name);
+      END;
+      IF v_error_mesg IS NULL 
+      THEN
+        INSERT INTO adm_slate_name_change
+          ( adm_pidm,
+            adm_id,
+            adm_guid,
+            adm_name_old,
+            adm_name_new,
+            adm_activity_date,
+            adm_data_origin,
+            adm_user_id)    
+        VALUES
+          (p_pidm_in,
+           p_id_in,
+           p_guid,
+           v_old_last_name || ', ' || v_old_first_name || ' ' || SUBSTR(v_old_mi_name, 1, 1) || '.',
+           v_last_name_in || ', ' || v_first_name_in || ' ' || v_mi_in,
+           sysdate,
+           p_origin_in,
+           p_user_in);
+           
+        COMMIT;
+      END IF;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      v_error_mesg := 'Error in data processing to determine name update for Banner pidm ' || p_pidm_in || '.';
+      p_handle_err(p_guid, v_error_mesg, v_proc_name);
+  END p_update_spriden_name;
   ---------
   
   PROCEDURE p_import_applicants
@@ -4746,4 +4885,132 @@ PROCEDURE p_srrprel_in_gjbprun(
     p_email_multi_pidms_err('SL');
     p_email_error;
   END p_run_email_procedures;
+  -----------
+  PROCEDURE p_send_mail_attachment 
+  (p_to          IN VARCHAR2,
+   p_from        IN VARCHAR2,
+   p_subject     IN VARCHAR2,
+   p_text_msg    IN VARCHAR2 DEFAULT NULL,
+   p_attach_name IN VARCHAR2 DEFAULT NULL,
+   p_attach_mime IN VARCHAR2 DEFAULT NULL,
+   p_attach_clob IN CLOB DEFAULT NULL)
+  AS
+    p_smtp_host       VARCHAR2 (50) := 'smtp.smith.edu';  
+    p_smtp_port       NUMBER        := 25;
+    l_mail_conn   UTL_SMTP.connection;
+    l_boundary    VARCHAR2(50) := '--_NextPart_BoundMul_RAC987345';
+    l_step        PLS_INTEGER  := 12000; -- make sure you set a multiple of 3 not higher than 24573
+  BEGIN
+    l_mail_conn := UTL_SMTP.open_connection(p_smtp_host, p_smtp_port);
+    UTL_SMTP.helo(l_mail_conn, p_smtp_host);
+    UTL_SMTP.mail(l_mail_conn, p_from);
+    UTL_SMTP.rcpt(l_mail_conn, p_to);
+  
+    UTL_SMTP.open_data(l_mail_conn);
+    
+    UTL_SMTP.write_data(l_mail_conn, 'Date: ' || TO_CHAR(SYSDATE, 'DD-MON-YYYY HH24:MI:SS') || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'To: ' || p_to || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'From: ' || p_from || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'Subject: ' || p_subject || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'Reply-To: ' || p_from || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'MIME-Version: 1.0' || UTL_TCP.crlf);
+    UTL_SMTP.write_data(l_mail_conn, 'Content-Type: multipart/mixed; boundary="' || l_boundary || '"' || UTL_TCP.crlf || UTL_TCP.crlf);
+    
+    IF p_text_msg IS NOT NULL THEN
+      UTL_SMTP.write_data(l_mail_conn, '--' || l_boundary || UTL_TCP.crlf);
+      UTL_SMTP.write_data(l_mail_conn, 'Content-Type: text/plain; charset="iso-8859-1"' || UTL_TCP.crlf || UTL_TCP.crlf);
+  
+      UTL_SMTP.write_data(l_mail_conn, p_text_msg);
+      UTL_SMTP.write_data(l_mail_conn, UTL_TCP.crlf || UTL_TCP.crlf);
+    END IF;
+  
+    IF p_attach_name IS NOT NULL THEN
+      UTL_SMTP.write_data(l_mail_conn, '--' || l_boundary || UTL_TCP.crlf);
+      UTL_SMTP.write_data(l_mail_conn, 'Content-Type: ' || p_attach_mime || '; name="' || p_attach_name || '"' || UTL_TCP.crlf);
+      UTL_SMTP.write_data(l_mail_conn, 'Content-Disposition: attachment; filename="' || p_attach_name || '"' || UTL_TCP.crlf || UTL_TCP.crlf);
+   
+      FOR i IN 0 .. TRUNC((DBMS_LOB.getlength(p_attach_clob) - 1 )/l_step) LOOP
+        UTL_SMTP.write_data(l_mail_conn, DBMS_LOB.substr(p_attach_clob, l_step, i * l_step + 1));
+      END LOOP;
+  
+      UTL_SMTP.write_data(l_mail_conn, UTL_TCP.crlf || UTL_TCP.crlf);
+    END IF;
+    
+    UTL_SMTP.write_data(l_mail_conn, '--' || l_boundary || '--' || UTL_TCP.crlf);
+    UTL_SMTP.close_data(l_mail_conn);
+  
+    UTL_SMTP.quit(l_mail_conn);
+  END p_send_mail_attachment;
+  ------
+  PROCEDURE p_report_adm_slate_name
+  IS 
+    l_message        CLOB;
+    l_count          NUMBER:=0;      
+    v_mailto         VARCHAR2(100);
+    v_mailfrom       VARCHAR2(100);
+    v_mailcc         VARCHAR2(100);
+    v_mailsubject    VARCHAR2(200) := '';
+    v_db             VARCHAR2(30);
+    v_file_name      VARCHAR2(30);
+    CURSOR adm_slate_name_csr
+    IS
+      SELECT *
+        FROM adm_slate_name_change
+       WHERE TRUNC(adm_activity_date) = TRUNC(SYSDATE);
+          
+    email_rec    adm_slate_name_csr%ROWTYPE; 
+   
+  BEGIN 
+    --Get DB environment
+    SELECT ora_database_name 
+    INTO v_db
+    FROM dual;
+    IF v_db = 'PROD.WORLD'
+    THEN
+      v_db := '**PROD** ';
+    ELSIF v_db = 'DEVX.WORLD'
+    THEN
+      v_db := '**DEVX** ';
+    ELSIF v_db = 'PPOD.WORLD'
+    THEN
+      v_db := '**PPOD** ';
+    END IF;
+    
+    IF adm_slate_name_csr%ISOPEN
+    THEN
+      CLOSE adm_slate_name_csr;
+    END IF;
+    OPEN adm_slate_name_csr;
+    LOOP 
+      FETCH adm_slate_name_csr INTO email_rec; 
+      EXIT WHEN adm_slate_name_csr%NOTFOUND;
+        
+      l_message := l_message || ( 
+                'Slate Ref ID#: '||email_rec.adm_guid ||chr(10)||chr(13)||
+                'Banner ID#: '||email_rec.adm_id ||chr(10)||chr(13)||
+                'Original Name: '||email_rec.adm_name_old ||chr(10)||chr(13)||
+                'Updated Name: '||email_rec.adm_name_new ||chr(10)||chr(13)||
+                'Process Run: '||email_rec.adm_data_origin||chr(10)||chr(13)||
+                'By User: '||email_rec.adm_user_id ||chr(10)||chr(13))||       
+                '================================================='||chr(10)||chr(13);
+      l_count := l_count+1;
+    END LOOP; 
+    CLOSE adm_slate_name_csr;     
+      
+    IF l_count > 0 
+    THEN   
+      v_mailsubject   :=  v_db || 'Report of Records with Name Change ' ||to_char(sysdate, 'MM/DD/YYYY') ;
+      v_mailfrom := 'tnguyen@smith.edu';
+      v_mailto := 'jdrawe@smith.edu';
+      v_file_name := 'SPAIDENUpdatedNames_' || to_char(sysdate, 'MM/DD/YYYY')  || '.txt';
+      p_send_mail_attachment(
+            p_to          => v_mailfrom,
+            p_from        => v_mailto,
+            p_subject     => v_mailsubject,
+            p_text_msg    => 'Please see attached report of students whose Banner name have been updated from Slate.',
+            p_attach_name => v_file_name,
+            p_attach_mime => 'text/plain',
+            p_attach_clob => l_message);
+    END IF; 
+  END  p_report_adm_slate_name;
 END import_slate_data_2_pkg;
