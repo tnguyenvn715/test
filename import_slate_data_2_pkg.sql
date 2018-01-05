@@ -4,7 +4,7 @@ IS
   FUNCTION f_string_midpoint(f_string IN VARCHAR2) RETURN NUMBER;
   FUNCTION f_translate_ethn_code(f_ethn_code IN VARCHAR2, f_hispanic_ind IN VARCHAR2) RETURN stvethn.stvethn_code%TYPE;
   FUNCTION f_translate_race_code(f_race_code IN VARCHAR2, f_hispanic_ind IN VARCHAR2) RETURN gorrace.gorrace_race_cde%TYPE;
-  FUNCTION f_translate_rtyp_code(f_prospect_type IN VARCHAR2, f_country_code IN VARCHAR2) RETURN srbrecr.srbrecr_rtyp_code%TYPE;
+  FUNCTION f_translate_rtyp_code(f_prospect_type IN VARCHAR2, f_term_code IN VARCHAR2, f_country_code IN VARCHAR2) RETURN srbrecr.srbrecr_rtyp_code%TYPE;
   FUNCTION f_translate_styp_code(f_prospect_type IN VARCHAR2) RETURN srbrecr.srbrecr_styp_code%TYPE;
   FUNCTION f_check_goradid_guid(f_additional_id IN goradid.goradid_additional_id%TYPE, f_adid_code IN goradid.goradid_adid_code%TYPE) RETURN NUMBER;
   FUNCTION f_check_goradid_pidm(f_goradid_pidm IN goradid.goradid_pidm%TYPE, f_adid_code IN goradid.goradid_adid_code%TYPE) RETURN NUMBER;
@@ -63,7 +63,7 @@ IS
     p_emal_code     srtemal.srtemal_emal_code%TYPE,
     p_data_origin   VARCHAR2,
     p_err_out   OUT VARCHAR2);
-  
+
   PROCEDURE p_insert_srtprel(
     p_guid           VARCHAR2,
     p_ridm           srtprel.srtprel_ridm%TYPE,
@@ -91,7 +91,6 @@ IS
     p_term_code         VARCHAR2,
     p_data_origin       VARCHAR2,
     p_err_out   OUT     VARCHAR2) ; 
-  
   PROCEDURE p_handle_err(
     p_guid          sdlperr.sdlperr_guid%TYPE,
     p_err_mesg      sdlperr.sdlperr_error%TYPE,
@@ -409,7 +408,7 @@ IS
     RETURN v_gorprac_race;
   END f_translate_race_code;
   -------
-  FUNCTION f_translate_rtyp_code(f_prospect_type IN VARCHAR2, f_country_code IN VARCHAR2) RETURN srbrecr.srbrecr_rtyp_code%TYPE
+FUNCTION f_translate_rtyp_code(f_prospect_type IN VARCHAR2, f_term_code IN VARCHAR2 , f_country_code IN VARCHAR2) RETURN srbrecr.srbrecr_rtyp_code%TYPE
   IS
     v_rtyp_code   srbrecr.srbrecr_rtyp_code%TYPE := NULL;
   BEGIN
@@ -433,7 +432,7 @@ IS
         v_rtyp_code := 'A2';
       END IF;
     END IF;
-      
+    
     IF f_prospect_type = 'TR'
     THEN
       IF f_country_code IS NULL OR f_country_code = 'US'
@@ -443,8 +442,30 @@ IS
         v_rtyp_code := 'T2';
       END IF;     
     END IF;    
-    
-    return v_rtyp_code;
+    --visiting students
+    IF f_prospect_type = 'VS'
+    THEN
+      --September Visiting
+      IF SUBSTR(f_term_code, length(f_term_code)-1, 2) = '01'
+      THEN
+        IF f_country_code IS NULL OR f_country_code = 'US'
+        THEN
+          v_rtyp_code := 'V1';
+        ELSE
+          v_rtyp_code := 'V2';
+        END IF;  
+      --January Visiting
+      ELSIF SUBSTR(f_term_code, length(f_term_code)-1, 2) = '03'
+      THEN
+        IF f_country_code IS NULL OR f_country_code = 'US'
+        THEN
+          v_rtyp_code := 'V3';
+        ELSE
+          v_rtyp_code := 'V4';
+        END IF;   
+      END IF;
+    END IF; 
+    RETURN v_rtyp_code;
   END f_translate_rtyp_code;
   -------
   FUNCTION f_translate_styp_code(f_prospect_type IN VARCHAR2) RETURN srbrecr.srbrecr_styp_code%TYPE
@@ -467,6 +488,10 @@ IS
       v_styp_code := 'B'; 
     END IF;
     
+    IF f_prospect_type = 'VS'
+    THEN
+      v_styp_code := 'K'; 
+    END IF;
     return v_styp_code;
   END f_translate_styp_code;
   --------
@@ -595,11 +620,14 @@ IS
   ------
   PROCEDURE p_import_pers_to_temp
   IS  
+    v_pros_pidm           szspros.szspros_pidm%TYPE;
     v_pros_type           szspros.szspros_pros_type%TYPE;
     v_term_code           szspros.szspros_term_code%TYPE;
     v_school_code         szspros.szspros_school_code%TYPE;
     v_school_type         szspros.szspros_school_type%TYPE;
     v_school_grad         szspros.szspros_school_grad%TYPE;
+    v_rtyp_code           stvrtyp.stvrtyp_code%TYPE;
+    v_key_seqno           srbrecr.srbrecr_admin_seqno%TYPE;
     v_error_mesg          VARCHAR2(200);
     v_szsiden_rec         szsiden%ROWTYPE;
     v_ridm                srtiden.srtiden_ridm%TYPE;
@@ -609,6 +637,8 @@ IS
     v_proc_name         VARCHAR2(60 CHAR) := 'p_import_pers_to_temp';
     v_goradid_guid_exist    NUMBER;
     v_goradid_pidm_exist    NUMBER;
+    srbrecr_cnt           NUMBER;
+    ident_rtyp_cnt        NUMBER;
     v_goradid_pidm        goradid.goradid_pidm%TYPE;
     srtprel_failed        EXCEPTION;
     no_szspros            EXCEPTION;
@@ -677,6 +707,7 @@ IS
           v_srtiden_match_status := 'M';
           v_srtiden_id := v_szsiden_rec.id;
           v_srtiden_pidm := v_szsiden_rec.pidm;    
+
         END IF;
         
         IF v_goradid_guid_exist = 0 AND v_szsiden_rec.pidm IS NULL --pidm not exist and alternate id not found in spriden -- new
@@ -724,31 +755,78 @@ IS
         END;
         --Retrieve prospect related data from staging table SZSPROS--
         BEGIN
-          SELECT szspros_pros_type, szspros_term_code, szspros_school_code, szspros_school_type,  szspros_school_grad
-          INTO v_pros_type, v_term_code, v_school_code, v_school_type, v_school_grad
+          SELECT szspros_pidm, szspros_pros_type, szspros_term_code, szspros_school_code, szspros_school_type,  szspros_school_grad
+          INTO v_pros_pidm, v_pros_type, v_term_code, v_school_code, v_school_type, v_school_grad
           FROM szspros 
           WHERE szspros_guid = v_szsiden_rec.guid; 
         EXCEPTION
           WHEN NO_DATA_FOUND THEN
             RAISE no_szspros;
         END;
-  
-        --SRTPREL: Ellucian Staging Table for Prospect Data
-        --------------------------------------------------
-        v_error_mesg := NULL;
+        --If term code is null and prospect type is FY, refer to grad date for term code
         IF v_pros_type = 'FY' AND v_term_code IS NULL 
         THEN 
           v_term_code := TO_CHAR(TO_NUMBER(SUBSTR(v_school_grad, 1, 4)) + 1)|| '01';
         END IF;
+        
+        v_rtyp_code := f_translate_rtyp_code(v_pros_type, v_term_code, v_szsiden_rec.ma_natn_code);
+        
+        --======================= JAN 3, 2018 CHANGES============ 
+        --USE API TO UPDATE RECRUIT TYPE DIRECTLY IN SRBRECR
+        --ONLY IF RECRUIT TYPE IN STAGE TABLE NOT MATCH WHAT'S CURRENTLY
+        --IN BANNER
+          
+        IF v_pros_pidm IS NOT NULL
+        THEN
+          SELECT COUNT(*)
+            INTO srbrecr_cnt
+            FROM srbrecr
+            WHERE srbrecr_pidm = v_pros_pidm
+            AND srbrecr_term_code = v_term_code;
+          SELECT COUNT(*)
+            INTO ident_rtyp_cnt
+            FROM srbrecr
+            WHERE srbrecr_pidm = v_pros_pidm
+            AND srbrecr_term_code = v_term_code
+            AND srbrecr_rtyp_code = v_rtyp_code;
+          IF srbrecr_cnt = 1 AND ident_rtyp_cnt = 0
+          THEN-- has srbrecr record, but diff rtyp_code, then update
+            v_key_seqno := baninst1.sb_recruit.F_GetSrbrecrSeqno(v_pros_pidm,  v_term_code, 'C');
+
+            BEGIN
+              BANINST1.SB_RECRUIT.P_UPDATE(
+                p_pidm  => v_pros_pidm,
+                p_term_code => v_term_code,
+                p_admin_seqno => v_key_seqno,
+                p_rtyp_code => v_rtyp_code,
+                p_data_origin => 'SLATE',
+                p_user_id => gb_common.f_sct_user);
+              COMMIT; 
+            
+            EXCEPTION
+              WHEN OTHERS THEN
+                v_error_mesg :=  'Failed to update to new recruit type for prospect record. ' || SUBSTR (TO_CHAR (SQLCODE) || ' ' || SQLERRM, 1, 300); 
+                p_handle_err(v_szsiden_rec.guid, v_error_mesg, v_proc_name);        
+            END;
+          END IF;
+        END IF;
+        --=======================END JAN 3, 2018 CHANGES============ 
+        
+        
+        --------------------------------------
+        --SRTPREL: Ellucian Staging Table for Prospect Data
+        --------------------------------------------------
+        v_error_mesg := NULL;
+        
         p_insert_srtprel( v_szsiden_rec.guid, v_ridm, 'SDLP', v_term_code,
-                          f_translate_rtyp_code(v_pros_type, v_szsiden_rec.ma_natn_code),
+                          v_rtyp_code,
                           f_translate_styp_code(v_pros_type),
                           'SLATE', v_error_mesg);
         IF v_error_mesg IS NOT NULL
         THEN
           RAISE srtprel_failed;
         END IF;
-
+        
         --SRTPERS: Ellucian staging table for SPBPERS
         --------------------------------------------------
         BEGIN
@@ -990,6 +1068,7 @@ IS
     v_guid                szsappl.szsappl_guid%TYPE;
     v_term_code           szsappl.szsappl_term_code_entry%TYPE;
     v_key_seqno           srbrecr.srbrecr_admin_seqno%TYPE;
+    v_pros_type           srbrecr.srbrecr_rtyp_code%TYPE;
     v_admt_code           saradap.saradap_admt_code%TYPE;
     v_styp_code           saradap.saradap_styp_code%TYPE;
     v_resd_code           saradap.saradap_resd_code%TYPE;
@@ -1053,17 +1132,52 @@ IS
           RAISE no_srbrecr_row; --no matching recruit record in SRBRECR
         END IF;  
       
+        --Get admit code-- need to look at prospect type for visiting cases
+        SELECT srbrecr_rtyp_code 
+        INTO v_pros_type
+        FROM srbrecr 
+        WHERE srbrecr_pidm = v_pidm 
+        AND srbrecr_term_code = v_term_code
+        AND srbrecr_admin_seqno = v_key_seqno;
+        
         --Get admit code
-        v_admt_code := szsappl_rec.szsappl_admt_code;
+          --January Visiting:   Slate Prospect Type = VS, Round = TJ
+          --September Visiting: Slate Prospect Type = VS, Round = TS
+          --January Transfer:   Slate Prospect Type = TJ, Round = TJ
+          --September Transfer: Slate Prospect Type = TS, Round = TS
+          --Others inferred by Round
+        IF szsappl_rec.szsappl_admt_code = 'TJ'
+        THEN
+          IF NVL(v_pros_type, 'NULL') LIKE 'V%'
+          THEN 
+            --January Visiting
+            v_admt_code := 'VJ';
+          ELSE 
+            --January Transfer
+            v_admt_code := szsappl_rec.szsappl_admt_code;
+          END IF;
+        ELSIF szsappl_rec.szsappl_admt_code = 'TS'
+        THEN
+          IF NVL(v_pros_type, 'NULL') LIKE 'V%'
+          THEN 
+            --September Visiting
+            v_admt_code := 'VS';
+          ELSE 
+            --September Transfer
+            v_admt_code := szsappl_rec.szsappl_admt_code;
+          END IF;    
+        ELSE 
+          --Other round codes
+          v_admt_code := szsappl_rec.szsappl_admt_code;
+        END IF;
+        
         --Get residence code
-        IF v_admt_code = 'AC' OR v_admt_code = 'AJ'
+        IF SUBSTR(szsappl_rec.szsappl_admt_code, 1 , 1) = 'A'
         THEN
-          v_resd_code := szsappl_rec.szsappl_ada_resd;
-      
-        ELSIF SUBSTR(v_admt_code, 1 , 1) = 'T'
+          v_resd_code := szsappl_rec.szsappl_ada_resd;    
+        ELSIF SUBSTR(szsappl_rec.szsappl_admt_code, 1 , 1) = 'T'
         THEN
-          v_resd_code := szsappl_rec.szsappl_tr_resd;
-         
+          v_resd_code := szsappl_rec.szsappl_tr_resd;        
         ELSE
           v_resd_code := szsappl_rec.szsappl_fy_resd;
         END IF; 
@@ -2039,7 +2153,7 @@ IS
     END LOOP; 
     CLOSE szsappl_c;
   END p_import_appl_schools;
-  -----------
+  ------
   PROCEDURE p_insert_srtprel(
     p_guid           VARCHAR2,
     p_ridm           srtprel.srtprel_ridm%TYPE,
@@ -2068,7 +2182,8 @@ IS
                     srtprel_rtyp_code,
                     srtprel_styp_code,
                     srtprel_data_origin,
-                    srtprel_activity_date)                          
+                    srtprel_activity_date,
+                    srtprel_user_id)                          
     VALUES(
                     p_ridm, 
                     p_prel_code,
@@ -2085,7 +2200,8 @@ IS
                     p_rtyp_code,
                     p_styp_code,
                     p_data_origin,
-                    SYSDATE);
+                    SYSDATE,
+                    gb_common.f_sct_user);
   EXCEPTION
     WHEN OTHERS THEN
       ROLLBACK TO pre_srtprel;
